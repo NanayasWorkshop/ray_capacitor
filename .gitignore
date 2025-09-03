@@ -1,0 +1,83 @@
+# Compiled executables
+*.exe
+*.out
+*.app
+
+# Object files
+*.o
+*.obj
+*.ko
+*.elf
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Build directories
+build/
+Debug/
+Release/
+x64/
+x86/
+
+# Binary directory (except the folder itself)
+bin/*
+!bin/.gitkeep
+
+# Output files
+output/*.txt
+output/*.ply
+ray_data.txt
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+ENV/
+capacitor_venv/
+.venv
+*.egg-info/
+dist/
+.pytest_cache/
+
+# IDE specific
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+
+# CAD backup files  
+*.log
+*_backup_*
+*.mtl.bak
+
+# Keep the directory structure
+!*/
+!.gitkeep
