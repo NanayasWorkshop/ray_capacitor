@@ -44,18 +44,6 @@ struct Matrix4x4 {
         float z = m[2][0] * point.x + m[2][1] * point.y + m[2][2] * point.z + m[2][3];
         return Vec3(x, y, z);
     }
-    
-    void print() const {
-        std::cout << "Matrix:" << std::endl;
-        for (int i = 0; i < 4; i++) {
-            std::cout << "  [";
-            for (int j = 0; j < 4; j++) {
-                std::cout << std::setw(10) << std::fixed << std::setprecision(6) << m[i][j];
-                if (j < 3) std::cout << ", ";
-            }
-            std::cout << "]" << std::endl;
-        }
-    }
 };
 
 struct CapacitorResult {
@@ -78,14 +66,61 @@ struct CapacitorResult {
 };
 
 struct SensorConfig {
-    std::string sensorName;        // "A", "B", "C"
-    std::string model1Name;        // "A1", "B1", "C1"
-    std::string model2Name;        // "A2", "B2", "C2"
-    std::string transformFile;     // "transformations_A.txt"
+    std::string sensorName;
+    std::string model1Name;
+    std::string model2Name;
+    std::string transformFile;
     Mesh model1Mesh;
     Mesh model2Mesh;
     std::vector<Matrix4x4> transformations;
 };
+
+struct RayData {
+    float origin[3];
+    float direction[3];
+    float hit_point[3];
+    bool hit;
+    float distance;
+};
+
+// Export ray data for animation visualization
+void exportRayDataForStep(const std::vector<RayData>& rays, const Mesh& posMesh, const Mesh& negMesh, 
+                         const std::string& sensorName, int step) {
+    std::string filename = "ray_data_" + sensorName + "_step_" + 
+                          (step < 10 ? "00" : (step < 100 ? "0" : "")) + std::to_string(step) + ".txt";
+    
+    std::ofstream file(filename);
+    
+    if (!file.is_open()) {
+        std::cout << "  -> ERROR: Could not create file " << filename << std::endl;
+        return;
+    }
+    
+    // Export positive mesh
+    file << "POSITIVE_MESH\n";
+    for (const auto& tri : posMesh.triangles) {
+        file << tri.v0[0] << " " << tri.v0[1] << " " << tri.v0[2] << " ";
+        file << tri.v1[0] << " " << tri.v1[1] << " " << tri.v1[2] << " ";
+        file << tri.v2[0] << " " << tri.v2[1] << " " << tri.v2[2] << "\n";
+    }
+    
+    // Export negative mesh
+    file << "NEGATIVE_MESH\n";
+    for (const auto& tri : negMesh.triangles) {
+        file << tri.v0[0] << " " << tri.v0[1] << " " << tri.v0[2] << " ";
+        file << tri.v1[0] << " " << tri.v1[1] << " " << tri.v1[2] << " ";
+        file << tri.v2[0] << " " << tri.v2[1] << " " << tri.v2[2] << "\n";
+    }
+    
+    // Export rays
+    file << "RAYS\n";
+    for (const auto& ray : rays) {
+        file << ray.origin[0] << " " << ray.origin[1] << " " << ray.origin[2] << " ";
+        file << ray.hit_point[0] << " " << ray.hit_point[1] << " " << ray.hit_point[2] << " ";
+        file << (ray.hit ? 1 : 0) << " " << ray.distance << "\n";
+    }
+    file.close();
+}
 
 // Load transformation matrices from file
 std::vector<Matrix4x4> loadTransformations(const std::string& filename) {
@@ -242,12 +277,13 @@ RTCScene createScene(RTCDevice device, const Mesh& mesh) {
     return scene;
 }
 
-// Calculate capacitor for a single configuration
-CapacitorResult calculateCapacitorStep(const Mesh& positiveMesh, const Mesh& negativeMesh, int step) {
+// Calculate capacitor for a single configuration with ray data collection
+CapacitorResult calculateCapacitorStep(const Mesh& positiveMesh, const Mesh& negativeMesh, int step, 
+                                     bool exportRays, const std::string& sensorName) {
     RTCDevice device = rtcNewDevice(nullptr);
     RTCScene negativeScene = createScene(device, negativeMesh);
     
-    const float maxDistance = 10.0f; // 10mm max search distance
+    const float maxDistance = 5.0f; // 5mm max search distance (REDUCED FROM 10mm)
     
     CapacitorResult result;
     result.step = step;
@@ -259,45 +295,118 @@ CapacitorResult calculateCapacitorStep(const Mesh& positiveMesh, const Mesh& neg
     result.misses = 0;
     result.translation = Vec3(0, 0, 0);
     
+    // Collect ray data for visualization if requested (ONLY HITS)
+    std::vector<RayData> rayDataCollection;
+    
     // Process each triangle in positive model
     for (size_t i = 0; i < positiveMesh.triangles.size(); i++) {
         float center[3], normal[3], area_mm2;
         getTriangleInfo(positiveMesh.triangles[i], center, normal, area_mm2);
         
-        // Setup ray (FLIPPED NORMAL DIRECTION)
-        RTCRayHit rayhit;
-        rayhit.ray.org_x = center[0];
-        rayhit.ray.org_y = center[1];
-        rayhit.ray.org_z = center[2];
-        rayhit.ray.dir_x = -normal[0];  // FLIP X
-        rayhit.ray.dir_y = -normal[1];  // FLIP Y
-        rayhit.ray.dir_z = -normal[2];  // FLIP Z
-        rayhit.ray.tnear = 0.0f;
-        rayhit.ray.tfar = maxDistance;
-        rayhit.ray.mask = -1;
-        rayhit.ray.flags = 0;
-        rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+        // TRY BOTH DIRECTIONS - shoot rays in both normal directions
+        bool hit_found = false;
+        float best_distance = maxDistance;
+        float best_hit_point[3];
+        float best_direction[3];
         
-        rtcIntersect1(negativeScene, &rayhit);
+        // Direction 1: Original flipped normal
+        {
+            RTCRayHit rayhit;
+            rayhit.ray.org_x = center[0];
+            rayhit.ray.org_y = center[1];
+            rayhit.ray.org_z = center[2];
+            rayhit.ray.dir_x = -normal[0];
+            rayhit.ray.dir_y = -normal[1];
+            rayhit.ray.dir_z = -normal[2];
+            rayhit.ray.tnear = 0.0f;
+            rayhit.ray.tfar = maxDistance;
+            rayhit.ray.mask = -1;
+            rayhit.ray.flags = 0;
+            rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+            
+            rtcIntersect1(negativeScene, &rayhit);
+            
+            if (rayhit.hit.geomID != RTC_INVALID_GEOMETRY_ID && rayhit.ray.tfar < best_distance) {
+                hit_found = true;
+                best_distance = rayhit.ray.tfar;
+                best_hit_point[0] = center[0] + (-normal[0]) * rayhit.ray.tfar;
+                best_hit_point[1] = center[1] + (-normal[1]) * rayhit.ray.tfar;
+                best_hit_point[2] = center[2] + (-normal[2]) * rayhit.ray.tfar;
+                best_direction[0] = -normal[0];
+                best_direction[1] = -normal[1];
+                best_direction[2] = -normal[2];
+            }
+        }
         
-        float distance_mm = (rayhit.hit.geomID != RTC_INVALID_GEOMETRY_ID) ? 
-                            rayhit.ray.tfar : maxDistance;
+        // Direction 2: Positive normal direction
+        {
+            RTCRayHit rayhit;
+            rayhit.ray.org_x = center[0];
+            rayhit.ray.org_y = center[1];
+            rayhit.ray.org_z = center[2];
+            rayhit.ray.dir_x = normal[0];
+            rayhit.ray.dir_y = normal[1];
+            rayhit.ray.dir_z = normal[2];
+            rayhit.ray.tnear = 0.0f;
+            rayhit.ray.tfar = maxDistance;
+            rayhit.ray.mask = -1;
+            rayhit.ray.flags = 0;
+            rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+            
+            rtcIntersect1(negativeScene, &rayhit);
+            
+            if (rayhit.hit.geomID != RTC_INVALID_GEOMETRY_ID && rayhit.ray.tfar < best_distance) {
+                hit_found = true;
+                best_distance = rayhit.ray.tfar;
+                best_hit_point[0] = center[0] + normal[0] * rayhit.ray.tfar;
+                best_hit_point[1] = center[1] + normal[1] * rayhit.ray.tfar;
+                best_hit_point[2] = center[2] + normal[2] * rayhit.ray.tfar;
+                best_direction[0] = normal[0];
+                best_direction[1] = normal[1];
+                best_direction[2] = normal[2];
+            }
+        }
         
-        if (rayhit.hit.geomID != RTC_INVALID_GEOMETRY_ID) {
+        // Update results based on best hit (if any)
+        if (hit_found) {
             result.hits++;
-            result.minDistance_mm = std::min(result.minDistance_mm, (double)distance_mm);
-            result.maxDistance_mm = std::max(result.maxDistance_mm, (double)distance_mm);
+            result.minDistance_mm = std::min(result.minDistance_mm, (double)best_distance);
+            result.maxDistance_mm = std::max(result.maxDistance_mm, (double)best_distance);
             result.totalArea_mm2 += area_mm2;
+            
+            // ONLY EXPORT RAYS THAT HIT
+            if (exportRays) {
+                RayData rd;
+                rd.origin[0] = center[0];
+                rd.origin[1] = center[1];
+                rd.origin[2] = center[2];
+                rd.direction[0] = best_direction[0];
+                rd.direction[1] = best_direction[1];
+                rd.direction[2] = best_direction[2];
+                rd.hit = true;
+                rd.distance = best_distance;
+                rd.hit_point[0] = best_hit_point[0];
+                rd.hit_point[1] = best_hit_point[1];
+                rd.hit_point[2] = best_hit_point[2];
+                
+                rayDataCollection.push_back(rd);
+            }
         } else {
             result.misses++;
+            // DO NOT EXPORT MISS RAYS
         }
     }
     
     // Calculate capacitance for parallel plates with glycerin dielectric
-    if (result.hits > 0 && result.minDistance_mm < 10.0) {
+    if (result.hits > 0 && result.minDistance_mm < 5.0) {  // Updated max distance check
         double area_m2 = result.totalArea_mm2 * 1e-6;  // Convert mm^2 to m^2
         double distance_m = result.minDistance_mm * 1e-3;  // Convert mm to m
         result.capacitance_pF = (EPSILON_0 * GLYCERIN_RELATIVE_PERMITTIVITY * area_m2 / distance_m) * 1e12;  // Convert to pF
+    }
+    
+    // Export ray data for animation if requested
+    if (exportRays) {
+        exportRayDataForStep(rayDataCollection, positiveMesh, negativeMesh, sensorName, step);
     }
     
     rtcReleaseScene(negativeScene);
@@ -339,20 +448,18 @@ Mesh loadOBJ(const std::string& filename) {
             double x, y, z;
             if (iss >> x >> y >> z) {
                 // MANUAL UNIT CONTROL:
-                // Set KEYSHOT_UNITS_MM to true if KeyShot exports are in millimeters
-                // Set to false if they are in meters
-                const bool KEYSHOT_UNITS_MM = true;  // CHANGE THIS IF NEEDED
+                const bool KEYSHOT_UNITS_MM = true;
                 
                 if (KEYSHOT_UNITS_MM) {
                     // KeyShot format: already in mm, use as-is
                     verts.push_back(Vec3(x, y, z));
-                    if (lineNumber == 7) {  // Debug first vertex
+                    if (lineNumber == 7) {
                         std::cout << "Units: Using KeyShot mm format, vertex: (" << x << ", " << y << ", " << z << ")" << std::endl;
                     }
                 } else {
                     // SolidEdge format: in meters, convert to mm
                     verts.push_back(Vec3(x * 1000.0f, y * 1000.0f, z * 1000.0f));
-                    if (lineNumber == 7) {  // Debug first vertex
+                    if (lineNumber == 7) {
                         std::cout << "Units: Converting meters to mm, vertex: (" << x*1000 << ", " << y*1000 << ", " << z*1000 << ")" << std::endl;
                     }
                 }
@@ -381,14 +488,6 @@ Mesh loadOBJ(const std::string& filename) {
                 int i1 = (indices[0] > 0) ? indices[0] - 1 : (int)verts.size() + indices[0];
                 int i2 = (indices[1] > 0) ? indices[1] - 1 : (int)verts.size() + indices[1];
                 int i3 = (indices[2] > 0) ? indices[2] - 1 : (int)verts.size() + indices[2];
-                
-                // Debug output for problematic faces
-                if (lineNumber > 11780 && lineNumber < 11790) {
-                    std::cout << "Debug line " << lineNumber << ": raw indices (" 
-                              << indices[0] << " " << indices[1] << " " << indices[2] 
-                              << ") -> converted (" << i1 << " " << i2 << " " << i3 
-                              << ") verts: " << verts.size() << std::endl;
-                }
                 
                 // Bounds checking
                 if (i1 >= 0 && i1 < (int)verts.size() && 
@@ -431,10 +530,13 @@ Mesh loadOBJ(const std::string& filename) {
 
 // Process a single model against the stationary negative plate
 void processModel(const std::string& modelName, const Mesh& modelMesh, const Mesh& stationaryNegative,
-                  const std::vector<Matrix4x4>& transformations, const std::string& sensorGroup) {
+                  const std::vector<Matrix4x4>& transformations, const std::string& sensorGroup, bool exportAnimation) {
     
     std::cout << "\n=== Processing Model " << modelName << " (Sensor Group " << sensorGroup << ") ===" << std::endl;
     std::cout << "Time steps: " << transformations.size() << std::endl;
+    if (exportAnimation) {
+        std::cout << "Animation export: ENABLED" << std::endl;
+    }
     
     std::vector<CapacitorResult> results;
     std::string outputFile = "capacitance_" + modelName + ".csv";
@@ -448,7 +550,8 @@ void processModel(const std::string& modelName, const Mesh& modelMesh, const Mes
         Mesh transformedModel = transformMesh(modelMesh, transformations[step]);
         
         // Calculate capacitance against stationary negative plate
-        CapacitorResult result = calculateCapacitorStep(transformedModel, stationaryNegative, step);
+        CapacitorResult result = calculateCapacitorStep(transformedModel, stationaryNegative, step, 
+                                                       exportAnimation, modelName);
         
         // Extract translation from matrix
         result.translation.x = transformations[step].m[0][3];
@@ -498,6 +601,10 @@ void processModel(const std::string& modelName, const Mesh& modelMesh, const Mes
     }
     
     std::cout << "Results saved to: " << outputFile << std::endl;
+    
+    if (exportAnimation) {
+        std::cout << "Animation data exported: ray_data_" << modelName << "_step_XXX.txt" << std::endl;
+    }
 }
 
 // Initialize sensor configurations
@@ -545,8 +652,17 @@ std::vector<SensorConfig> initializeSensors() {
 }
 
 int main(int argc, char** argv) {
+    bool exportAnimation = (argc > 1 && std::string(argv[1]) == "-anim");
+    
     std::cout << "=== Multi-Sensor Dynamic Capacitor Calculator (Glycerin Dielectric) ===" << std::endl;
     std::cout << "Using glycerin relative permittivity: " << GLYCERIN_RELATIVE_PERMITTIVITY << std::endl;
+    
+    if (exportAnimation) {
+        std::cout << "\n*** ANIMATION MODE ENABLED ***" << std::endl;
+        std::cout << "Will export ray data for each time step" << std::endl;
+        std::cout << "Use: python multi_sensor_animated_viewer.py animate" << std::endl;
+    }
+    
     std::cout << "\nExpected model files:" << std::endl;
     std::cout << "  - A1_model.obj, A2_model.obj" << std::endl;
     std::cout << "  - B1_model.obj, B2_model.obj" << std::endl;
@@ -582,11 +698,11 @@ int main(int argc, char** argv) {
         
         // Process Model 1 (e.g., A1)
         processModel(sensor.model1Name, sensor.model1Mesh, stationaryNegative, 
-                    sensor.transformations, sensor.sensorName);
+                    sensor.transformations, sensor.sensorName, exportAnimation);
         
         // Process Model 2 (e.g., A2)  
         processModel(sensor.model2Name, sensor.model2Mesh, stationaryNegative,
-                    sensor.transformations, sensor.sensorName);
+                    sensor.transformations, sensor.sensorName, exportAnimation);
     }
     
     std::cout << "\n" << std::string(60, '=') << std::endl;
@@ -596,6 +712,16 @@ int main(int argc, char** argv) {
         std::cout << "  - capacitance_" << sensor.model1Name << ".csv" << std::endl;
         std::cout << "  - capacitance_" << sensor.model2Name << ".csv" << std::endl;
     }
+    
+    if (exportAnimation) {
+        std::cout << "\nAnimation files generated:" << std::endl;
+        std::cout << "  - ray_data_[sensor]_step_[XXX].txt files" << std::endl;
+        std::cout << "\nTo view animation:" << std::endl;
+        std::cout << "  python multi_sensor_animated_viewer.py animate" << std::endl;
+        std::cout << "To view single step:" << std::endl;
+        std::cout << "  python multi_sensor_animated_viewer.py [step_number]" << std::endl;
+    }
+    
     std::cout << std::string(60, '=') << std::endl;
     
     return 0;
